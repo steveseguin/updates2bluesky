@@ -1,0 +1,15 @@
+name = "bluesky-json-sync"
+main = "src/worker.js"
+compatibility_date = "2024-01-01"
+
+kv_namespaces = [
+  { binding = "BLUESKY_SYNC_KV", id = "514bb41a20974a1aa66a1c1f3c351658" }
+]
+
+[triggers]
+crons = ["0 * * * *"]  # Runs hourly
+
+[vars]
+BLUESKY_USERNAME = "vdoninja.bsky.social"
+BLUESKY_PASSWORD = "ITa2CxUjEv1HwDX4"
+JSON_SOURCE_URL = "https://gist.githubusercontent.com/steveseguin/274f00dc5667f7c9bfa782503942744b/raw/50de2d52cf709ba3d66e4ada51fb7f317601e5a6/updates.json"
