@@ -10,6 +10,6 @@ kv_namespaces = [
 crons = ["0 * * * *"]  # Runs hourly
 
 [vars]
-BLUESKY_USERNAME = "vdoninja.bsky.social"
-BLUESKY_PASSWORD = "ITa2CxUjEv1HwDX4"
+BLUESKY_USERNAME = "vdoninja.bsky.social" # follow me!
+BLUESKY_PASSWORD = "ITa2CxUjEv1HwDX4" # Just for example
 JSON_SOURCE_URL = "https://gist.githubusercontent.com/steveseguin/274f00dc5667f7c9bfa782503942744b/raw/50de2d52cf709ba3d66e4ada51fb7f317601e5a6/updates.json"
