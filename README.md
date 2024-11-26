@@ -111,6 +111,19 @@ The default schedule runs hourly at minute 0. To modify this, adjust the cron pa
 3. If you see duplicate posts:
    - Check if the KV namespace is properly configured
    - Verify that message IDs are unique in your JSON feed
+  
+## Two-Factor Authentication
+
+If you have 2FA enabled on your Bluesky account, you'll need to use an App Password instead of your regular password in the wrangler.toml file.
+To create an App Password in Bluesky:
+
+Go to Settings
+1. Select "App Passwords"
+2. Click "Create App Password"
+3. Give it a name (like "JSON Sync")
+4. Copy the generated password
+
+Then update your wrangler.toml file to use this App Password instead of your main account password:
 
 ## Security Notes
 
