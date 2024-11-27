@@ -28,103 +28,133 @@ class BlueskySync {
     this.env = env;
     this.apiUrl = 'https://bsky.social/xrpc/';
     this.accessJwt = null;
-  }
-
-  async sync() {
-    try {
-      await this.login();
-      const postedMsgIds = await this.getPostedMsgIds();
-      const feed = await this.fetchJSONFeed();
-      
-      // Find new entries
-      const newEntries = feed
-        .filter(entry => !postedMsgIds.includes(entry.msgid))
-        .sort((a, b) => a.timestamp - b.timestamp); // oldest first
-      
-      // Group entries that can be combined
-      const groupedPosts = this.groupEntriesForPosting(newEntries);
-      
-      // Post each group
-      for (const group of groupedPosts) {
-        if (group.length === 1) {
-          await this.postToBluesky(group[0]);
-        } else {
-          await this.postCombinedEntries(group);
-        }
-        
-        // Update posted message IDs
-        group.forEach(entry => postedMsgIds.push(entry.msgid));
-      }
-      
-      // Trim old message IDs if needed
-      if (postedMsgIds.length > 1000) {
-        postedMsgIds.splice(0, postedMsgIds.length - 1000);
-      }
-      
-      await this.savePostedMsgIds(postedMsgIds);
-      return new Response(`Sync completed. Posted ${newEntries.length} entries in ${groupedPosts.length} posts.`, { status: 200 });
-    } catch (error) {
-      console.error('Sync failed:', error);
-      return new Response(`Sync failed: ${error.message}`, { status: 500 });
-    }
+    this.MAX_POST_LENGTH = 300;
+    this.COMBINE_WINDOW = 1000; // 16.67 minutes
   }
   
-  groupEntriesForPosting(entries) {
-    const MAX_POST_LENGTH = 300; // Bluesky's character limit
-    const TIME_WINDOW = 3600; // 1 hour in seconds
-    const groups = [];
-    let currentGroup = [];
-    let currentLength = 0;
+  formatText(content) {
+    if (!content) return '';
     
-    for (const entry of entries) {
-      const entryText = this.formatEntryText(entry);
-      
-      // Check if this entry can be combined with current group
-      const canCombine = currentGroup.length > 0 &&
-        Math.abs(entry.timestamp - currentGroup[currentGroup.length - 1].timestamp) <= TIME_WINDOW &&
-        currentLength + entryText.length + 2 <= MAX_POST_LENGTH && // +2 for separator
-        // Only combine if neither entry has attachments
-        !entry.attachments?.length &&
-        !currentGroup.some(e => e.attachments?.length);
-      
-      if (canCombine) {
-        currentGroup.push(entry);
-        currentLength += entryText.length + 2; // +2 for separator
-      } else {
-        if (currentGroup.length > 0) {
-          groups.push(currentGroup);
-        }
-        currentGroup = [entry];
-        currentLength = entryText.length;
-      }
-    }
-    
-    if (currentGroup.length > 0) {
-      groups.push(currentGroup);
-    }
-    
-    return groups;
-  }
-  
-  formatEntryText(entry) {
-    return entry.content.trim();
+    return content
+      // Handle bullet points
+      .replace(/^- /gm, '• ')
+      // Handle bold text
+      .replace(/\*\*(.*?)\*\*/g, '𝗯$1𝗯')
+      // Handle arrows
+      .replace(/->/g, '➜')
+      // Clean up excessive newlines
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
   }
 
-  async postCombinedEntries(entries) {
-    const combinedText = entries
-      .map(entry => this.formatEntryText(entry))
+  shouldCombineMessages(entries) {
+    if (entries.length < 2) return false;
+    
+    // Check if entries are within the time window
+    const newest = entries[0].timestamp;
+    const oldest = entries[entries.length - 1].timestamp;
+    if (newest - oldest > this.COMBINE_WINDOW) return false;
+    
+    // Calculate combined length
+    const combinedLength = entries.reduce((acc, entry) => 
+      acc + (entry.content ? this.formatText(entry.content).length : 0), 0);
+      
+    return combinedLength <= this.MAX_POST_LENGTH;
+  }
+
+	async processFeed(sortedEntries) {
+	  let currentBatch = [];
+	  const processedMsgIds = new Set();
+	  const postedMsgIds = await this.getPostedMsgIds();
+	  
+	  for (let i = 0; i < sortedEntries.length; i++) {
+		const entry = sortedEntries[i];
+		
+		// Skip if already posted in previous runs
+		if (postedMsgIds.includes(entry.msgid)) continue;
+		
+		// Skip if already processed in this run
+		if (processedMsgIds.has(entry.msgid)) continue;
+		
+		currentBatch = [entry];
+		
+		// Look ahead for potential combinations
+		while (i + 1 < sortedEntries.length) {
+		  const nextEntry = sortedEntries[i + 1];
+		  const potentialBatch = [...currentBatch, nextEntry];
+		  
+		  if (this.shouldCombineMessages(potentialBatch)) {
+			currentBatch.push(nextEntry);
+			processedMsgIds.add(nextEntry.msgid);
+			i++;
+		  } else {
+			break;
+		  }
+		}
+		
+		// Create the post
+		await this.createCombinedPost(currentBatch);
+		
+		// Update state after each successful post
+		for (const processedEntry of currentBatch) {
+		  processedMsgIds.add(processedEntry.msgid);
+		  if (!postedMsgIds.includes(processedEntry.msgid)) {
+			postedMsgIds.push(processedEntry.msgid);
+			// Save state after each successful post
+			await this.savePostedMsgIds(postedMsgIds);
+		  }
+		}
+	  }
+	}
+
+
+  async createCombinedPost(entries) {
+    // Combine text content
+    const text = entries
+      .map(entry => this.formatText(entry.content))
+      .filter(Boolean)
       .join('\n\n');
-    
+      
+    // Skip empty posts
+    if (!text && !entries.some(e => e.attachments?.length > 0)) {
+      return;
+    }
+
+    // Gather all images (up to 4, Bluesky's limit)
+    const images = [];
+    for (const entry of entries) {
+      if (entry.attachments) {
+        for (const attachment of entry.attachments) {
+          if (attachment.mime.startsWith('image/') && images.length < 4) {
+            const imageData = await this.fetchAndUploadImage(attachment.url);
+            if (imageData) {
+              images.push(imageData);
+            }
+          }
+        }
+      }
+    }
+
+    // Create post data
     const postData = {
       repo: this.env.BLUESKY_USERNAME,
       collection: 'app.bsky.feed.post',
       record: {
         $type: 'app.bsky.feed.post',
-        text: combinedText,
+        text: text || "New update available",
         createdAt: new Date().toISOString(),
       }
     };
 
+    // Add images if we have them
+    if (images.length > 0) {
+      postData.record.embed = {
+        $type: 'app.bsky.embed.images',
+        images: images
+      };
+    }
+
+    // Post to Bluesky
     const response = await fetch(`${this.apiUrl}com.atproto.repo.createRecord`, {
       method: 'POST',
       headers: {
@@ -135,10 +165,77 @@ class BlueskySync {
     });
 
     if (!response.ok) {
-      throw new Error('Failed to create combined post');
+      throw new Error(`Failed to create post: ${await response.text()}`);
+    }
+  }
+
+  async fetchAndUploadImage(url) {
+    try {
+      const imageResponse = await fetch(url);
+      if (!imageResponse.ok) return null;
+
+      const blob = await imageResponse.blob();
+      
+      const uploadResponse = await fetch(`${this.apiUrl}com.atproto.repo.uploadBlob`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': blob.type,
+          'Authorization': `Bearer ${this.accessJwt}`
+        },
+        body: blob
+      });
+
+      if (!uploadResponse.ok) return null;
+
+      const data = await uploadResponse.json();
+      return {
+        alt: 'Update image',
+        image: data.blob
+      };
+    } catch (error) {
+      console.error('Failed to fetch or upload image:', error);
+      return null;
     }
   }
   
+  async sync() {
+    try {
+		// Login to Bluesky
+		await this.login();
+
+		// Fetch current state from KV store
+		const postedMsgIds = await this.getPostedMsgIds();
+
+		// Fetch and parse JSON feed
+		const feed = await this.fetchJSONFeed();
+
+		// Sort entries by timestamp (newest first)
+		const sortedEntries = feed.sort((a, b) => b.timestamp - a.timestamp);
+
+		// Process new entries
+		await this.processFeed(sortedEntries.filter(entry => !postedMsgIds.includes(entry.msgid)));
+
+		// Update posted message IDs
+		const allProcessedIds = sortedEntries
+		  .filter(entry => !postedMsgIds.includes(entry.msgid))
+		  .map(entry => entry.msgid);
+		postedMsgIds.push(...allProcessedIds);
+
+		// Keep only last 1000 message IDs
+		if (postedMsgIds.length > 1000) {
+		  postedMsgIds.splice(0, postedMsgIds.length - 1000);
+		}
+
+		// Save updated state
+		await this.savePostedMsgIds(postedMsgIds);
+
+		return new Response('Sync completed successfully', { status: 200 });
+	} catch (error) {
+		console.error('Sync failed:', error);
+		return new Response(`Sync failed: ${error.message}`, { status: 500 });
+	}
+  }
+
   async login() {
     const response = await fetch(`${this.apiUrl}com.atproto.server.createSession`, {
       method: 'POST',
@@ -157,115 +254,96 @@ class BlueskySync {
     this.accessJwt = data.accessJwt;
   }
 
-  async fetchJSONFeed() {
-    const response = await fetch(this.env.JSON_SOURCE_URL);
-    if (!response.ok) {
-      throw new Error('Failed to fetch JSON feed');
-    }
-    return response.json();
-  }
-
-  async uploadImage(imageUrl, mime) {
-    try {
-      console.log(`Downloading image from: ${imageUrl}`);
-      
-      const imageResponse = await fetch(imageUrl);
-      if (!imageResponse.ok) {
-        console.error(`Failed to download image: ${imageResponse.status}`);
-        return null;
-      }
-
-      const imageArrayBuffer = await imageResponse.arrayBuffer();
-      
-      console.log(`Uploading image to Bluesky (${imageArrayBuffer.byteLength} bytes)`);
-      
-      const uploadResponse = await fetch(`${this.apiUrl}com.atproto.repo.uploadBlob`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': mime,
-          'Authorization': `Bearer ${this.accessJwt}`
-        },
-        body: imageArrayBuffer
-      });
-
-      if (!uploadResponse.ok) {
-        console.error(`Failed to upload image: ${uploadResponse.status}`);
-        return null;
-      }
-
-      const result = await uploadResponse.json();
-      console.log('Image upload successful, blob:', result.blob);
-
-      return {
-        alt: '',
-        image: result.blob
-      };
-    } catch (error) {
-      console.error('Error handling image:', error);
-      return null;
-    }
-  }
+	async fetchJSONFeed() {
+	  const response = await fetch(this.env.JSON_SOURCE_URL);
+	  if (!response.ok) {
+		throw new Error('Failed to fetch JSON feed');
+	  }
+	  const feed = await response.json();
+	  
+	  // Validate feed structure
+	  if (!Array.isArray(feed)) {
+		throw new Error('Feed must be an array');
+	  }
+	  
+	  // Validate each entry has required fields
+	  feed.forEach((entry, index) => {
+		if (!entry.msgid) {
+		  throw new Error(`Entry at index ${index} missing msgid`);
+		}
+		if (!entry.timestamp) {
+		  throw new Error(`Entry at index ${index} missing timestamp`);
+		}
+		// Convert string timestamps to numbers if needed
+		if (typeof entry.timestamp === 'string') {
+		  entry.timestamp = new Date(entry.timestamp).getTime();
+		}
+	  });
+	  
+	  return feed;
+	}
 
   async postToBluesky(entry) {
-    try {
-      const text = entry.content || '';
-      const imageRefs = [];
+    const text = entry.content || '';
+    let images = [];
 
-      // Handle attachments if present
-      if (entry.attachments && entry.attachments.length > 0) {
-        console.log(`Processing ${entry.attachments.length} attachments`);
-        
-        for (const attachment of entry.attachments) {
-          if (attachment.mime.startsWith('image/')) {
-            console.log(`Processing image: ${attachment.url}`);
-            const imageRef = await this.uploadImage(attachment.url, attachment.mime);
-            if (imageRef) {
-              imageRefs.push(imageRef);
-            }
+    // Handle attachments if present
+    if (entry.attachments && entry.attachments.length > 0) {
+      for (const attachment of entry.attachments) {
+        if (attachment.mime.startsWith('image/')) {
+          const imageResponse = await fetch(attachment.url);
+          if (imageResponse.ok) {
+            const blob = await imageResponse.blob();
+            images.push({
+              blob,
+              mime: attachment.mime
+            });
           }
         }
       }
+    }
 
-      const postData = {
-        repo: this.env.BLUESKY_USERNAME,
-        collection: 'app.bsky.feed.post',
-        record: {
-          $type: 'app.bsky.feed.post',
-          text: text,
-          createdAt: new Date().toISOString()
+    // Upload images first if present
+    const imageRefs = [];
+    if (images.length > 0) {
+      for (const image of images) {
+        const uploadResp = await this.uploadImage(image.blob, image.mime);
+        if (uploadResp) {
+          imageRefs.push(uploadResp);
         }
+      }
+    }
+
+    // Create the post
+    const postData = {
+      repo: this.env.BLUESKY_USERNAME,
+      collection: 'app.bsky.feed.post',
+      record: {
+        $type: 'app.bsky.feed.post',
+        text: text,
+        createdAt: new Date().toISOString(),
+      }
+    };
+
+    // Add images if we have them
+    if (imageRefs.length > 0) {
+      postData.record.embed = {
+        $type: 'app.bsky.embed.images',
+        images: imageRefs
       };
+    }
 
-      if (imageRefs.length > 0) {
-        console.log(`Attaching ${imageRefs.length} images to post`);
-        postData.record.embed = {
-          $type: 'app.bsky.embed.images',
-          images: imageRefs
-        };
-      }
+    const response = await fetch(`${this.apiUrl}com.atproto.repo.createRecord`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.accessJwt}`
+      },
+      body: JSON.stringify(postData)
+    });
 
-      console.log('Creating post with data:', JSON.stringify(postData, null, 2));
-
-      const response = await fetch(`${this.apiUrl}com.atproto.repo.createRecord`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.accessJwt}`
-        },
-        body: JSON.stringify(postData)
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to create post: ${errorText}`);
-      }
-
-      const result = await response.json();
-      console.log('Post created successfully:', result);
-      
-    } catch (error) {
-      console.error('Error creating post:', error);
-      throw error;
+    if (!response.ok) {
+      throw new Error('Failed to create post');
     }
   }
 
