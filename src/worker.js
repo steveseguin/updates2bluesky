@@ -56,8 +56,10 @@ class BlueskySync {
     if (newest - oldest > this.COMBINE_WINDOW) return false;
     
     // Calculate combined length
-    const combinedLength = entries.reduce((acc, entry) => 
-      acc + (entry.content ? this.formatText(entry.content).length : 0), 0);
+    const combinedLength = entries
+      .map(entry => this.formatText(entry.content))
+      .filter(Boolean)
+      .join('\n\n').length;
       
     return combinedLength <= this.MAX_POST_LENGTH;
   }
@@ -386,3 +388,4 @@ class BlueskySync {
     }
   }
 }
+
