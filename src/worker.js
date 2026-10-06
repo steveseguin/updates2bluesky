@@ -55,6 +55,11 @@ class BlueskySync {
     const oldest = entries[entries.length - 1].timestamp;
     if (newest - oldest > this.COMBINE_WINDOW) return false;
     
+    // Preserve every image when combining otherwise valid feed entries.
+    const imageCount = entries.reduce((count, entry) => count +
+      (entry.attachments || []).filter(attachment => attachment.mime.startsWith('image/')).length, 0);
+    if (imageCount > 4) return false;
+
     // Calculate combined length
     const combinedLength = entries.reduce((acc, entry) => 
       acc + (entry.content ? this.formatText(entry.content).length : 0), 0);
